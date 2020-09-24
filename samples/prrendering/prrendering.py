@@ -27,20 +27,19 @@ DEFAULT_LOGS_DIR = os.path.join(ROOT_DIR, "logs")
 
 class PRRConfig(Config):
 
-    # Give the configuration a recognizable name
     NAME = "prrendering"
 
-    # We use a GPU with 12GB memory, which can fit two images.
-    # Adjust down if you use a smaller GPU.
-    IMAGES_PER_GPU = 2
+    GPU_COUNT = 1
+    IMAGES_PER_GPU = 1
 
-    # Number of classes (including background)
+    IMAGE_MIN_DIM = 540
+    IMAGE_MAX_DIM = 960
+
     NUM_CLASSES = 1 + 3  # Background + bench vise, phone, drill
+    MAX_GT_INSTANCES = 50
 
-    # Number of training steps per epoch
     STEPS_PER_EPOCH = 100
 
-    # Skip detections with < 90% confidence
     DETECTION_MIN_CONFIDENCE = 0.9
 
 
@@ -101,6 +100,9 @@ class PRRDataset(utils.Dataset):
             currMask = segs == currID
             masks.append(currMask)
             ids.append(currCls)
+            # cv2.imshow(f"{seg}", currMask * 255.0)
+            # cv2.waitKey(0)
+            # cv2.destroyAllWindows()
 
         if len(masks) > 0:
             mask = np.stack(masks, axis=2)
@@ -211,9 +213,12 @@ if __name__ == '__main__':
     # Find last trained weights
     if args.weights.lower() == "last":
         weights_path = model.find_last()
+    else:
+        weights_path = None
 
     # Load weights
-    model.load_weights(weights_path, by_name=True)
+    if weights_path is not None:
+        model.load_weights(weights_path, by_name=True)
 
     # Train or evaluate
     if args.command == "train":
