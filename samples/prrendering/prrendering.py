@@ -1,9 +1,7 @@
-from csv import reader
 import os
-from os import read
 import sys
 import numpy as np
-import cv
+import cv2
 import csv
 import re
 
@@ -73,7 +71,7 @@ class PRRDataset(utils.Dataset):
         if image_info["source"] != "prrendering":
             return super(self.__class__, self).load_mask(image_id)
 
-        num = [int(s) for s in re.findall(r"\d+")][0]
+        num = [int(s) for s in re.findall(r"\d+", image_info["path"])][0]
         label = os.path.join(os.path.split(os.path.split(image_info["path"])[0])[0], "annotations", "labels_{0:06d}.csv".format(num))
         seg = os.path.join(os.path.split(os.path.split(image_info["path"])[0])[0], "segs", "img_{0:06d}.png".format(num))
 
@@ -81,6 +79,7 @@ class PRRDataset(utils.Dataset):
 
         with open(label, newline="") as csvfile:
             reader = csv.reader(csvfile, delimiter=";")
+            next(reader)
             for row in reader:
                 if row[4] == "wrench":
                     currClass = 1
@@ -89,22 +88,26 @@ class PRRDataset(utils.Dataset):
                 elif row[4] == "drill":
                     currClass = 3
                 else:
-                    currClass = -1
-                currID = row[6]
+                    currClass = 0
+                currID = int(row[6])
                 objects.append((currClass, currID))
 
-        segs = cv.imread(seg, flags=cv.IMREAD_GRAYSCALE)
+        segs = cv2.imread(seg, flags=cv2.IMREAD_GRAYSCALE)
 
         masks = []
         ids = []
 
         for currCls, currID in objects:
             currMask = segs == currID
-            masks.append(currMask.astype(np.bool))
+            masks.append(currMask)
             ids.append(currCls)
 
-        mask = np.stack(masks, axis=2)
-        id = np.array(ids, dtype=np.int32)
+        if len(masks) > 0:
+            mask = np.stack(masks, axis=2)
+            id = np.array(ids, dtype=np.int32)
+        else:
+            mask = np.zeros([segs.shape[0], segs.shape[1], 1], dtype=np.uint8).astype(np.bool)
+            id = np.array([0], dtype=np.int32)
 
         return mask, id
 
@@ -120,19 +123,19 @@ def train(model):
 
     # Training dataset.
     dataset_train = PRRDataset()
-    dataset_train.load_balloon(os.path.join(args.dataset, "train", "rgb"))
+    dataset_train.load_images(os.path.join(args.dataset, "train", "rgb"))
     dataset_train.prepare()
 
     # Validation dataset
     dataset_val = PRRDataset()
-    dataset_val.load_balloon(os.path.join(args.dataset, "val", "rgb"))
+    dataset_val.load_images(os.path.join(args.dataset, "val", "rgb"))
     dataset_val.prepare()
 
     # Training - Stage 1
     print("Training network heads")
     model.train(dataset_train, dataset_val,
                 learning_rate=config.LEARNING_RATE,
-                epochs=40,
+                epochs=20,
                 layers='heads')
 
     # Training - Stage 2
@@ -140,7 +143,7 @@ def train(model):
     print("Fine tune Resnet stage 4 and up")
     model.train(dataset_train, dataset_val,
                 learning_rate=config.LEARNING_RATE,
-                epochs=120,
+                epochs=40,
                 layers='4+')
 
     # Training - Stage 3
@@ -148,7 +151,7 @@ def train(model):
     print("Fine tune all layers")
     model.train(dataset_train, dataset_val,
                 learning_rate=config.LEARNING_RATE / 10,
-                epochs=160,
+                epochs=60,
                 layers='all')
 
 ############################################################
@@ -167,6 +170,9 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', required=False,
                         metavar="/path/to/dataset/",
                         help='Directory of the dataset')
+    parser.add_argument('--weights', required=True,
+                        metavar="/path/to/weights.h5",
+                        help="Path to weights .h5 file")
     parser.add_argument('--logs', required=False,
                         default=DEFAULT_LOGS_DIR,
                         metavar="/path/to/logs/",
@@ -201,6 +207,13 @@ if __name__ == '__main__':
     else:
         model = modellib.MaskRCNN(mode="inference", config=config,
                                   model_dir=args.logs)
+
+    # Find last trained weights
+    if args.weights.lower() == "last":
+        weights_path = model.find_last()
+
+    # Load weights
+    model.load_weights(weights_path, by_name=True)
 
     # Train or evaluate
     if args.command == "train":
