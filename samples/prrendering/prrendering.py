@@ -100,16 +100,13 @@ class PRRDataset(utils.Dataset):
             currMask = segs == currID
             masks.append(currMask)
             ids.append(currCls)
-            # cv2.imshow(f"{seg}", currMask * 255.0)
-            # cv2.waitKey(0)
-            # cv2.destroyAllWindows()
 
         if len(masks) > 0:
             mask = np.stack(masks, axis=2)
             id = np.array(ids, dtype=np.int32)
         else:
-            mask = np.zeros([segs.shape[0], segs.shape[1], 1], dtype=np.uint8).astype(np.bool)
-            id = np.array([0], dtype=np.int32)
+            print(f"{num} no masks, fix first")
+            exit()
 
         return mask, id
 
@@ -120,6 +117,42 @@ class PRRDataset(utils.Dataset):
         else:
             super(self.__class__, self).image_reference(image_id)
 
+############################################################
+#  Training
+############################################################
+
+def traintest(model):
+
+    # Training dataset.
+    dataset_train = PRRDataset()
+    dataset_train.load_images(os.path.join(args.dataset, "train", "rgb"))
+    dataset_train.prepare()
+
+    # Validation dataset
+    dataset_val = PRRDataset()
+    dataset_val.load_images(os.path.join(args.dataset, "val", "rgb"))
+    dataset_val.prepare()
+
+    # Training - Stage 1
+    print("Training network heads")
+    model.train(dataset_train, dataset_val,
+                learning_rate=config.LEARNING_RATE,
+                epochs=1,
+                layers='heads')
+
+    # Training - Stage 2
+    print("Fine tune stage 4+")
+    model.train(dataset_train, dataset_val,
+                learning_rate=config.LEARNING_RATE,
+                epochs=2,
+                layers='4+')
+
+    # Training - Stage 3
+    print("Fine tune all stages")
+    model.train(dataset_train, dataset_val,
+                learning_rate=config.LEARNING_RATE,
+                epochs=3,
+                layers='all')
 
 def train(model):
 
@@ -137,27 +170,62 @@ def train(model):
     print("Training network heads")
     model.train(dataset_train, dataset_val,
                 learning_rate=config.LEARNING_RATE,
-                epochs=20,
+                epochs=30,
                 layers='heads')
 
+    exit()
+
     # Training - Stage 2
-    # Finetune layers from ResNet stage 4 and up
     print("Fine tune Resnet stage 4 and up")
     model.train(dataset_train, dataset_val,
-                learning_rate=config.LEARNING_RATE,
-                epochs=40,
+                learning_rate=config.LEARNING_RATE / 10,
+                epochs=45,
                 layers='4+')
 
+    exit()
+
     # Training - Stage 3
-    # Fine tune all layers
-    print("Fine tune all layers")
+    print("Fine tune all stages")
     model.train(dataset_train, dataset_val,
-                learning_rate=config.LEARNING_RATE / 10,
+                learning_rate=config.LEARNING_RATE / 100,
                 epochs=60,
                 layers='all')
 
 ############################################################
-#  Training
+#  Evaluation
+############################################################
+
+def evaluate(model):
+
+    basedir = args.dataset
+    rgbs = os.path.join(basedir, "rgb")
+    masks = os.path.join(basedir, "mask_visib")
+    gts = os.path.join(basedir, "scene_gt_info.json")
+
+    # Load dataset
+    with os.scandir(rgbs) as folder:
+        for file in folder:
+            img = cv2.imread(file.path)
+            r = model.detect([img])[0]
+
+            print(r["rois"])
+            print(r["class_ids"])
+            print(r["scores"])
+
+            if len(r["rois"]) > 0:
+                split = np.split(r["masks"], len(r["class_ids"]), axis=2)
+
+                count = 0
+                for mask in split:
+                    count += 1
+                    cv2.imshow(f"{file.name}: {count}", mask * 255.0)
+
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+
+
+############################################################
+#  Other
 ############################################################
 
 if __name__ == '__main__':
@@ -185,7 +253,7 @@ if __name__ == '__main__':
     if args.command == "train":
         assert args.dataset, "Argument --dataset is required for training"
     elif args.command == "evaluate":
-        assert False
+        assert args.dataset, "Argument --dataset is required for evaluation"
 
     print("Dataset: ", args.dataset)
     print("Logs: ", args.logs)
@@ -193,36 +261,52 @@ if __name__ == '__main__':
     # Configurations
     if args.command == "train":
         config = PRRConfig()
+    elif args.command == "traintest":
+        class TestConfig(PRRConfig):
+            LEARNING_RATE = 0.00003
+            STEPS_PER_EPOCH = 500
+        config = TestConfig()
     else:
         class InferenceConfig(PRRConfig):
-            # Set batch size to 1 since we'll be running inference on
-            # one image at a time. Batch size = GPU_COUNT * IMAGES_PER_GPU
             GPU_COUNT = 1
             IMAGES_PER_GPU = 1
         config = InferenceConfig()
     config.display()
 
     # Create model
-    if args.command == "train":
+    if args.command == "train" or args.command == "traintest":
         model = modellib.MaskRCNN(mode="training", config=config,
                                   model_dir=args.logs)
     else:
         model = modellib.MaskRCNN(mode="inference", config=config,
                                   model_dir=args.logs)
 
+    # Select weights file to load
+    if args.weights.lower() == "coco":
+        weights_path = COCO_WEIGHTS_PATH
+        # Download weights file
+        if not os.path.exists(weights_path):
+            utils.download_trained_weights(weights_path)
     # Find last trained weights
-    if args.weights.lower() == "last":
+    elif args.weights.lower() == "last":
         weights_path = model.find_last()
     else:
         weights_path = None
 
     # Load weights
-    if weights_path is not None:
+    print(f"Loading weights {weights_path}")
+    if args.weights.lower() == "coco":
+        model.load_weights(weights_path, by_name=True, exclude=["mrcnn_class_logits", "mrcnn_bbox_fc","mrcnn_bbox", "mrcnn_mask"])
+    else:
         model.load_weights(weights_path, by_name=True)
 
     # Train or evaluate
     if args.command == "train":
         train(model)
+    elif args.command == "traintest":
+        traintest(model)
+    elif args.command == "evaluate":
+        evaluate(model)
     else:
         print("'{}' is not recognized. "
               "Use 'train' or 'evaluate'".format(args.command))
