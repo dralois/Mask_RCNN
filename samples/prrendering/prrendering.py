@@ -4,6 +4,9 @@ import numpy as np
 import cv2
 import csv
 import re
+import json
+
+from numpy.core.fromnumeric import mean, squeeze
 
 # Root directory of the project
 ROOT_DIR = os.path.abspath("../../")
@@ -121,39 +124,6 @@ class PRRDataset(utils.Dataset):
 #  Training
 ############################################################
 
-def traintest(model):
-
-    # Training dataset.
-    dataset_train = PRRDataset()
-    dataset_train.load_images(os.path.join(args.dataset, "train", "rgb"))
-    dataset_train.prepare()
-
-    # Validation dataset
-    dataset_val = PRRDataset()
-    dataset_val.load_images(os.path.join(args.dataset, "val", "rgb"))
-    dataset_val.prepare()
-
-    # Training - Stage 1
-    print("Training network heads")
-    model.train(dataset_train, dataset_val,
-                learning_rate=config.LEARNING_RATE,
-                epochs=1,
-                layers='heads')
-
-    # Training - Stage 2
-    print("Fine tune stage 4+")
-    model.train(dataset_train, dataset_val,
-                learning_rate=config.LEARNING_RATE,
-                epochs=2,
-                layers='4+')
-
-    # Training - Stage 3
-    print("Fine tune all stages")
-    model.train(dataset_train, dataset_val,
-                learning_rate=config.LEARNING_RATE,
-                epochs=3,
-                layers='all')
-
 def train(model):
 
     # Training dataset.
@@ -173,16 +143,12 @@ def train(model):
                 epochs=30,
                 layers='heads')
 
-    exit()
-
     # Training - Stage 2
     print("Fine tune Resnet stage 4 and up")
     model.train(dataset_train, dataset_val,
                 learning_rate=config.LEARNING_RATE / 10,
                 epochs=45,
                 layers='4+')
-
-    exit()
 
     # Training - Stage 3
     print("Fine tune all stages")
@@ -191,37 +157,104 @@ def train(model):
                 epochs=60,
                 layers='all')
 
+    # Training - Stage 4
+    print("Fine tune all stages again")
+    model.train(dataset_train, dataset_val,
+                learning_rate=config.LEARNING_RATE / 1000,
+                epochs=100,
+                layers='all')
+
 ############################################################
 #  Evaluation
 ############################################################
 
 def evaluate(model):
 
-    basedir = args.dataset
-    rgbs = os.path.join(basedir, "rgb")
-    masks = os.path.join(basedir, "mask_visib")
-    gts = os.path.join(basedir, "scene_gt_info.json")
+    currClass = args.object
+    baseDir = args.dataset
+    rgbDir = os.path.join(baseDir, "rgb")
+    maskDir = os.path.join(baseDir, "mask_visib")
+    gtFile = json.load(open(os.path.join(baseDir, "scene_gt_info.json"), "r"))
+
+    allF1s = []
+    allIoUs = []
 
     # Load dataset
-    with os.scandir(rgbs) as folder:
+    with os.scandir(rgbDir) as folder:
         for file in folder:
+            imgNum = [int(s) for s in re.findall(r"\d+", file.name)][0]
+            # Real image
             img = cv2.imread(file.path)
+            # Ground truth mask
+            mask = cv2.imread(os.path.join(maskDir, "{0:06d}_000000.png".format(imgNum)),
+                flags=cv2.IMREAD_GRAYSCALE).astype(np.bool)
+            # Ground truth bbox
+            bboxGt = gtFile[str(imgNum)][0]["bbox_visib"]
+            bboxGt[2] += bboxGt[0]
+            bboxGt[3] += bboxGt[1]
+
+            # Run detection
             r = model.detect([img])[0]
+            predClasses = r["class_ids"]
+            if len(predClasses) > 1:
+                splitMasks = np.squeeze(np.split(r["masks"], len(predClasses), axis=2))
+            elif len(predClasses) == 1:
+                splitMasks = [np.squeeze(r["masks"])]
+            else:
+                splitMasks = []
+            bboxes = []
+            classes = []
+            scores = []
+            masks = []
 
-            print(r["rois"])
-            print(r["class_ids"])
-            print(r["scores"])
+            # Filter out incorrect classes
+            for i in range(0, len(predClasses)):
+                if predClasses[i] == int(currClass):
+                    bboxes.append(r["rois"][i])
+                    classes.append(currClass)
+                    scores.append(r["scores"][i])
+                    masks.append(splitMasks[i])
 
-            if len(r["rois"]) > 0:
-                split = np.split(r["masks"], len(r["class_ids"]), axis=2)
+            if len(classes) > 0:
+                # Format filtered lists
+                bboxes = np.array(bboxes, dtype=np.int32)
+                classes = np.array(classes, dtype=np.int32)
+                scores = np.array(scores, dtype=np.float32)
+                masks = np.stack(masks, axis=2)
 
-                count = 0
-                for mask in split:
-                    count += 1
-                    cv2.imshow(f"{file.name}: {count}", mask * 255.0)
+                # Format gt
+                gt_boxes = np.array([bboxGt], dtype=np.int32)
+                gt_class_ids = np.array([currClass], dtype=np.int32)
+                gt_masks = np.stack([mask], axis=2)
 
-                cv2.waitKey(0)
-                cv2.destroyAllWindows()
+                # Calculate precision, recall and IoU metric
+                _, precisions, recalls, ious = utils.compute_ap(gt_boxes, gt_class_ids, gt_masks, bboxes, classes, scores, masks)
+
+                # Calculate F1 metric
+                f1 = 2.0 * (((mean(precisions) * mean(recalls))) / (mean(precisions) + mean(recalls)))
+                filtered = ious[np.where(ious > 0.01)]
+                iou = (0.0, mean(filtered))[len(filtered) > 0]
+
+                # Store and log
+                print(f"Metrics for {file.name}: F1: {f1}, IoUs: {iou}")
+                allF1s.append(f1)
+                allIoUs.append(iou)
+            else:
+                print(f"Metrics for {file.name}: F1: {0.0}, IoUs: {0.0}")
+                allF1s.append(0.0)
+                allIoUs.append(0.0)
+
+    npF1s = np.array(allF1s)
+    npIoUs = np.array(allIoUs)
+    filteredF1 = npF1s[np.where(npF1s > 0.01)]
+    filteredIoU = npIoUs[np.where(npIoUs > 0.01)]
+
+    meanF1 = mean(allF1s)
+    meanIoU = mean(allIoUs)
+    meanF1Filtered = mean(filteredF1)
+    meanIoUFiltered = mean(filteredIoU)
+
+    print(f"Final scores for {baseDir}: F1: {meanF1}, IoU: {meanIoU}; Filtered: F1: {meanF1Filtered}, IoU: {meanIoUFiltered}")
 
 
 ############################################################
@@ -240,6 +273,9 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', required=False,
                         metavar="/path/to/dataset/",
                         help='Directory of the dataset')
+    parser.add_argument('--object', required=False,
+                        metavar="Object class 1,2 or 3",
+                        help='Evaluate this object class')
     parser.add_argument('--weights', required=True,
                         metavar="/path/to/weights.h5",
                         help="Path to weights .h5 file")
@@ -254,6 +290,7 @@ if __name__ == '__main__':
         assert args.dataset, "Argument --dataset is required for training"
     elif args.command == "evaluate":
         assert args.dataset, "Argument --dataset is required for evaluation"
+        assert args.object, "Argument --object is required for evaluation"
 
     print("Dataset: ", args.dataset)
     print("Logs: ", args.logs)
@@ -261,20 +298,16 @@ if __name__ == '__main__':
     # Configurations
     if args.command == "train":
         config = PRRConfig()
-    elif args.command == "traintest":
-        class TestConfig(PRRConfig):
-            LEARNING_RATE = 0.00003
-            STEPS_PER_EPOCH = 500
-        config = TestConfig()
     else:
         class InferenceConfig(PRRConfig):
             GPU_COUNT = 1
             IMAGES_PER_GPU = 1
+            DETECTION_MIN_CONFIDENCE = 0.6
         config = InferenceConfig()
     config.display()
 
     # Create model
-    if args.command == "train" or args.command == "traintest":
+    if args.command == "train":
         model = modellib.MaskRCNN(mode="training", config=config,
                                   model_dir=args.logs)
     else:
@@ -291,7 +324,7 @@ if __name__ == '__main__':
     elif args.weights.lower() == "last":
         weights_path = model.find_last()
     else:
-        weights_path = None
+        weights_path = args.weights
 
     # Load weights
     print(f"Loading weights {weights_path}")
@@ -303,8 +336,6 @@ if __name__ == '__main__':
     # Train or evaluate
     if args.command == "train":
         train(model)
-    elif args.command == "traintest":
-        traintest(model)
     elif args.command == "evaluate":
         evaluate(model)
     else:
