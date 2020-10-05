@@ -214,6 +214,9 @@ def evaluate(model):
                     classes.append(currClass)
                     scores.append(r["scores"][i])
                     masks.append(splitMasks[i])
+                    # Store masks
+                    outName = f'{os.path.join(baseDir, "out", "mask_")}{imgNum}_{i}.png'
+                    cv2.imwrite(outName, splitMasks[i] * 255.0)
 
             if len(classes) > 0:
                 # Format filtered lists
@@ -223,12 +226,23 @@ def evaluate(model):
                 masks = np.stack(masks, axis=2)
 
                 # Format gt
-                gt_boxes = np.array([bboxGt], dtype=np.int32)
+                gt_boxes = np.array([(bboxGt[1], bboxGt[0], bboxGt[3], bboxGt[2])], dtype=np.int32)
                 gt_class_ids = np.array([currClass], dtype=np.int32)
                 gt_masks = np.stack([mask], axis=2)
 
                 # Calculate precision, recall and IoU metric
                 _, precisions, recalls, ious = utils.compute_ap(gt_boxes, gt_class_ids, gt_masks, bboxes, classes, scores, masks)
+
+                # Imprint bounding boxes
+                cv2.rectangle(img, (gt_boxes[0][1], gt_boxes[0][0]), (gt_boxes[0][3], gt_boxes[0][2]), (0, 255, 0), 2)
+                for i in range(0, len(bboxes)):
+                    cv2.putText(img, f"{round(float(scores[i]), 2)} ({classes[i]})", (bboxes[i][1], bboxes[i][0]+20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.rectangle(img, (bboxes[i][1], bboxes[i][0]), (bboxes[i][3], bboxes[i][2]), (0, 0, 255), 2)
+
+                # Store to masks
+                outName = f'{os.path.join(baseDir, "out", "box_")}{imgNum}.png'
+                cv2.imwrite(outName, img)
 
                 # Calculate F1 metric
                 f1 = 2.0 * (((mean(precisions) * mean(recalls))) / (mean(precisions) + mean(recalls)))
@@ -303,6 +317,7 @@ if __name__ == '__main__':
             GPU_COUNT = 1
             IMAGES_PER_GPU = 1
             DETECTION_MIN_CONFIDENCE = 0.6
+            DETECTION_MAX_INSTANCES = 5
         config = InferenceConfig()
     config.display()
 
